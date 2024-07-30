@@ -1,9 +1,7 @@
 import tensorflow as tf
 from tensorflow.keras import layers, models, optimizers, losses
 import numpy as np
-from sklearn.metrics import accuracy_score
 from typing import Tuple, Dict, Any
-import random
 from dataclasses import dataclass
 from absl import app, flags, logging
 import os
@@ -16,7 +14,6 @@ flags.DEFINE_integer('shuffle_buffer', 1000, 'Buffer size for dataset shuffling'
 flags.DEFINE_float('learning_rate', 0.001, 'Initial learning rate')
 flags.DEFINE_integer('num_epochs', 10, 'Number of training epochs')
 flags.DEFINE_string('model_dir', 'model_checkpoints', 'Directory to save model checkpoints')
-flags.DEFINE_string('data_dir', 'data', 'Directory containing input data')
 flags.DEFINE_boolean('use_tpu', False, 'Whether to use TPU for training')
 flags.DEFINE_string('tpu_name', None, 'Name of the TPU to use')
 
@@ -27,6 +24,10 @@ class DataConfig:
     movie_dim: int = 11
     rating_dim: int = 4
     graph_dim: int = 16
+    num_users: int = 1000
+    num_movies: int = 500
+    num_ratings: int = 10000
+    num_graph_nodes: int = 1000
 
 # Data Engine Layer
 class BaseTable:
@@ -43,7 +44,7 @@ class BaseTable:
             rating = tf.random.shuffle(self.rating_data)[0]
             yield user, movie, rating
     
-    def get_dataset(self) -> tf.data.Dataset:
+    def get_dataset(self, batch_size: int, shuffle_buffer: int) -> tf.data.Dataset:
         return tf.data.Dataset.from_generator(
             self._generator,
             output_signature=(
@@ -51,7 +52,7 @@ class BaseTable:
                 tf.TensorSpec(shape=(DataConfig.movie_dim,), dtype=tf.float32),
                 tf.TensorSpec(shape=(DataConfig.rating_dim,), dtype=tf.float32)
             )
-        ).batch(FLAGS.batch_size).shuffle(FLAGS.shuffle_buffer).prefetch(tf.data.AUTOTUNE)
+        ).batch(batch_size).shuffle(shuffle_buffer).prefetch(tf.data.AUTOTUNE)
 
 class BaseGraph:
     def __init__(self, graph_data: tf.Tensor, edge_index: tf.Tensor):
@@ -134,12 +135,15 @@ def train_step(model: BRIDGE, inputs: Tuple[tf.Tensor, tf.Tensor, tf.Tensor],
         loss += sum(model.losses)  # Add regularization losses
     grads = tape.gradient(loss, model.trainable_variables)
     optimizer.apply_gradients(zip(grads, model.trainable_variables))
-    accuracy = tf.reduce_mean(tf.cast(tf.equal(tf.argmax(outputs, axis=1), labels), tf.float32))
+    
+    # Ensure consistent data types
+    predictions = tf.cast(tf.argmax(outputs, axis=1), tf.int32)
+    accuracy = tf.reduce_mean(tf.cast(tf.equal(predictions, labels), tf.float32))
     return loss, accuracy
 
 def train_model(model: BRIDGE, dataset: tf.data.Dataset, optimizer: optimizers.Optimizer, 
                 loss_fn: losses.Loss, graph_data: tf.Tensor, edge_index: tf.Tensor, 
-                num_epochs: int = FLAGS.num_epochs) -> Dict[str, Any]:
+                num_epochs: int) -> Dict[str, Any]:
     history = {'loss': [], 'accuracy': [], 'val_loss': [], 'val_accuracy': []}
     for epoch in range(num_epochs):
         epoch_loss_avg = tf.keras.metrics.Mean()
@@ -185,16 +189,17 @@ def evaluate_model(model: BRIDGE, dataset: tf.data.Dataset, graph_data: tf.Tenso
         labels = tf.random.uniform(shape=(tf.shape(outputs)[0],), maxval=7, dtype=tf.int32)
         loss = loss_fn(labels, outputs)
         loss_avg.update_state(loss)
-        accuracy.update_state(tf.reduce_mean(tf.cast(tf.equal(tf.argmax(outputs, axis=1), labels), tf.float32)))
+        predictions = tf.cast(tf.argmax(outputs, axis=1), tf.int32)
+        accuracy.update_state(tf.reduce_mean(tf.cast(tf.equal(predictions, labels), tf.float32)))
     
     return loss_avg.result().numpy(), accuracy.result().numpy()
 
-def load_data(data_dir: str) -> Tuple[tf.Tensor, tf.Tensor, tf.Tensor, tf.Tensor, tf.Tensor]:
-    user_data = tf.convert_to_tensor(np.load(os.path.join(data_dir, 'user_data.npy')), dtype=tf.float32)
-    movie_data = tf.convert_to_tensor(np.load(os.path.join(data_dir, 'movie_data.npy')), dtype=tf.float32)
-    rating_data = tf.convert_to_tensor(np.load(os.path.join(data_dir, 'rating_data.npy')), dtype=tf.float32)
-    graph_data = tf.convert_to_tensor(np.load(os.path.join(data_dir, 'graph_data.npy')), dtype=tf.float32)
-    edge_index = tf.convert_to_tensor(np.load(os.path.join(data_dir, 'edge_index.npy')), dtype=tf.int32)
+def generate_synthetic_data(config: DataConfig) -> Tuple[tf.Tensor, tf.Tensor, tf.Tensor, tf.Tensor, tf.Tensor]:
+    user_data = tf.random.normal((config.num_users, config.user_dim))
+    movie_data = tf.random.normal((config.num_movies, config.movie_dim))
+    rating_data = tf.random.normal((config.num_ratings, config.rating_dim))
+    graph_data = tf.random.normal((config.num_graph_nodes, config.graph_dim))
+    edge_index = tf.random.uniform((2, config.num_ratings), 0, config.num_graph_nodes, dtype=tf.int32)
     return user_data, movie_data, rating_data, graph_data, edge_index
 
 # Main execution
@@ -204,14 +209,14 @@ def main(argv):
     # Set up logging
     logging.set_verbosity(logging.INFO)
 
-    # Load data
-    user_data, movie_data, rating_data, graph_data, edge_index = load_data(FLAGS.data_dir)
+    # Generate synthetic data
+    config = DataConfig()
+    user_data, movie_data, rating_data, graph_data, edge_index = generate_synthetic_data(config)
 
     # Create dataset
-    dataset = BaseTable(user_data, movie_data, rating_data).get_dataset()
+    dataset = BaseTable(user_data, movie_data, rating_data).get_dataset(FLAGS.batch_size, FLAGS.shuffle_buffer)
 
     # Create model
-    config = DataConfig()
     table_encoder = TableEncoder(config.user_dim + config.movie_dim + config.rating_dim, 32, 64)
     graph_encoder = GraphEncoder(config.graph_dim, 32)
     model = BRIDGE(table_encoder, graph_encoder)
@@ -235,6 +240,7 @@ def main(argv):
     history = train_model(model, dataset, optimizer, loss_fn, graph_data, edge_index, num_epochs=FLAGS.num_epochs)
 
     # Save training history
+    os.makedirs(FLAGS.model_dir, exist_ok=True)
     with open(os.path.join(FLAGS.model_dir, 'training_history.json'), 'w') as f:
         json.dump(history, f)
 
