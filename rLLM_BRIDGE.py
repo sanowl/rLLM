@@ -10,7 +10,7 @@ import json
 import matplotlib.pyplot as plt
 import seaborn as sns
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import confusion_matrix, classification_report
+from sklearn.metrics import confusion_matrix, classification_report, roc_curve, auc, precision_recall_curve
 from datetime import datetime
 import kerastuner as kt
 import wandb
@@ -385,6 +385,15 @@ def plot_precision_recall_curve(y_true, y_pred, save_path: str):
     plt.savefig(save_path)
     plt.close()
 
+def plot_model_architecture(model: models.Model, save_path: str):
+    keras.utils.plot_model(model, to_file=save_path, show_shapes=True, show_layer_names=True)
+
+def data_augmentation(user_data: tf.Tensor, movie_data: tf.Tensor, rating_data: tf.Tensor) -> Tuple[tf.Tensor, tf.Tensor, tf.Tensor]:
+    user_data = tf.image.random_flip_left_right(user_data)
+    movie_data = tf.image.random_flip_up_down(movie_data)
+    rating_data = rating_data + tf.random.normal(tf.shape(rating_data), mean=0.0, stddev=0.1)
+    return user_data, movie_data, rating_data
+
 def main(argv):
     del argv  # Unused
 
@@ -420,6 +429,9 @@ def main(argv):
 
     # Save model summary
     save_model_summary(model, os.path.join(run_dir, 'model_summary.txt'))
+    
+    # Save model architecture
+    plot_model_architecture(model, os.path.join(run_dir, 'model_architecture.png'))
 
     # Set up callbacks
     tensorboard_callback = tf.keras.callbacks.TensorBoard(log_dir=os.path.join(run_dir, 'logs'))
@@ -462,6 +474,12 @@ def main(argv):
 
     # Generate classification report
     generate_classification_report(all_labels, all_predictions, os.path.join(run_dir, 'classification_report.json'))
+
+    # Plot ROC curve
+    plot_roc_curve(all_labels, all_predictions, os.path.join(run_dir, 'roc_curve.png'))
+
+    # Plot Precision-Recall curve
+    plot_precision_recall_curve(all_labels, all_predictions, os.path.join(run_dir, 'precision_recall_curve.png'))
 
     # Save final model
     model.save(os.path.join(run_dir, 'final_model'))
